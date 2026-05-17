@@ -1,4 +1,4 @@
-# 🔒 SecureChat-JS (ZS BTSA Case Study)
+# 🔒 SecureChat-JS 
 
 **SecureChat-JS** is a real-time, end-to-end encrypted messaging platform designed for high-sensitivity industries like life sciences and healthcare. This project demonstrates technical proficiency in real-time communication (WebSockets), data security (AES-256), and business intelligence (Platform Analytics).
 
