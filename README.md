@@ -1,4 +1,5 @@
-# 🔒 SecureChat
+
+# 🔒 SecureChat-JS 
 
 **SecureChat** is a real-time, end-to-end encrypted messaging platform designed for secure enterprise communication. This project demonstrates technical proficiency in real-time communication (WebSockets), data security (AES-256), and operational intelligence (Platform Analytics).
 
