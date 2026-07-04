@@ -1,112 +1,110 @@
+const http = require('http');
 const { WebSocketServer } = require('ws');
 const { v4: uuidv4 } = require('uuid');
-const { initDB, logAuditEvent, getAuditLogs, getDatabaseStats } = require('./database');
+const { initDB, logAuditEvent } = require('./database');
 
-const PORT = 8080;
-const wss = new WebSocketServer({ port: PORT });
+const WS_PORT = 8080;
 
-// Business Intelligence / Stats (BTSA Focus)
-let stats = {
-    totalMessages: 0,
-    startTime: Date.now(),
-    peakUsers: 0,
-    recentEvents: [] 
-};
+const httpServer = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('SecureChat Backend Running');
+});
+
+const wss = new WebSocketServer({ server: httpServer });
+
+// Room state: roomId -> { clients: Set, adminId: string, maxCapacity: number }
+let rooms = new Map();
 
 async function startServer() {
     await initDB();
-    console.log(`[SERVER] SecureChat Backend running on port ${PORT}`);
+    httpServer.listen(WS_PORT, () => {
+        console.log(`[WS] Server listening on port ${WS_PORT}`);
+    });
 }
 
 startServer();
 
-function logSystemEvent(msg) {
-    stats.recentEvents.unshift({
-        id: uuidv4().substring(0, 8),
-        msg,
-        time: new Date().toLocaleTimeString()
-    });
-    if (stats.recentEvents.length > 5) stats.recentEvents.pop();
-}
-
-let rooms = new Map(); // roomId -> Set of sockets
-
 wss.on('connection', (socket) => {
-    logSystemEvent('New node connection established');
-    
-    if (wss.clients.size > stats.peakUsers) {
-        stats.peakUsers = wss.clients.size;
-    }
-
-    socket.on('message', (data) => {
+    socket.on('message', async (data) => {
         try {
             const parsedData = JSON.parse(data);
             const { type, payload } = parsedData;
 
             switch (type) {
                 case 'join':
-                    handleJoin(socket, payload);
+                    await handleJoin(socket, payload);
                     break;
                 case 'chat':
                     handleChat(socket, payload);
                     break;
+                case 'set-capacity':
+                    handleSetCapacity(socket, payload);
+                    break;
                 case 'request-stats':
                     sendStats(socket);
                     break;
-                default:
-                    console.log('[WARN] Unknown message type:', type);
             }
         } catch (err) {
-            console.error('[ERR] Failed to parse message:', err);
+            console.error('[ERR] Failed to process message:', err);
         }
     });
 
-    socket.on('close', () => {
-        handleDisconnect(socket);
-    });
+    socket.on('close', () => handleDisconnect(socket));
 });
 
 async function handleJoin(socket, payload) {
-    const { roomId, name, caseId, category } = payload;
-    socket.roomId = roomId;
-    socket.userName = name;
+    const { roomId, name, purpose } = payload;
     socket.userId = uuidv4();
-    socket.caseId = caseId;
-    socket.category = category;
+    socket.userName = name;
+    socket.roomId = roomId;
+    socket.purpose = purpose;
 
-    if (!rooms.has(roomId)) {
-        rooms.set(roomId, new Set());
-        logSystemEvent(`New room initialized: ${roomId}`);
+    let room = rooms.get(roomId);
+
+    if (!room) {
+        // First user creates the room and becomes Admin
+        room = {
+            clients: new Set(),
+            adminId: socket.userId,
+            maxCapacity: 10 // default
+        };
+        rooms.set(roomId, room);
+    } else {
+        // Room exists, check capacity
+        if (room.clients.size >= room.maxCapacity) {
+            socket.send(JSON.stringify({
+                type: 'error',
+                payload: { message: 'Room is full. Admin limit reached.' }
+            }));
+            socket.close();
+            return;
+        }
     }
-    rooms.get(roomId).add(socket);
 
-    logSystemEvent(`${name} authenticated & joined ${roomId}`);
-    
-    // PERSISTENT AUDIT LOG
-    await logAuditEvent(caseId, category, 'SESSION_JOIN', name, `Joined room ${roomId}`);
+    room.clients.add(socket);
+    const isAdmin = room.adminId === socket.userId;
 
     socket.send(JSON.stringify({
         type: 'join-success',
-        payload: { userId: socket.userId }
+        payload: { userId: socket.userId, isAdmin, maxCapacity: room.maxCapacity }
     }));
+
+    await logAuditEvent(roomId, name, purpose, 'JOIN');
 
     broadcastToRoom(roomId, {
         type: 'system',
-        payload: {
-            message: `${name} has entered the secure room.`,
-            timestamp: new Date().toISOString()
-        }
+        payload: { message: `${name} joined the chat.`, timestamp: new Date().toISOString() }
     });
+
+    broadcastStats(roomId);
 }
 
 function handleChat(socket, payload) {
     const { message, roomId } = payload;
-    stats.totalMessages++;
-
     broadcastToRoom(roomId, {
         type: 'chat',
         payload: {
-            message: message, 
+            message,
             senderName: socket.userName,
             senderId: socket.userId,
             timestamp: new Date().toISOString()
@@ -114,55 +112,80 @@ function handleChat(socket, payload) {
     });
 }
 
-async function sendStats(socket) {
-    const dbStats = await getDatabaseStats();
-    const logs = await getAuditLogs(5); // Get recent logs for the UI
+function handleSetCapacity(socket, payload) {
+    const { roomId, capacity } = payload;
+    const room = rooms.get(roomId);
 
-    socket.send(JSON.stringify({
-        type: 'stats-update',
-        payload: {
-            activeUsers: wss.clients.size,
-            totalMessages: stats.totalMessages,
-            uptimeMinutes: Math.floor((Date.now() - stats.startTime) / 60000),
-            peakUsers: stats.peakUsers,
-            recentEvents: stats.recentEvents,
-            auditLogs: logs, // NEW: Relational data
-            dataStored: `${dbStats.logCount * 0.5} KB`, // Simulated size
-            encryptionStandard: 'AES-256 GCM/CBC',
-            protocol: 'wss/v1.2',
-            dbType: dbStats.dbType
+    if (room && room.adminId === socket.userId) {
+        room.maxCapacity = parseInt(capacity, 10);
+        broadcastStats(roomId);
+    }
+}
+
+function sendStats(socket) {
+    if (socket.roomId) {
+        const room = rooms.get(socket.roomId);
+        if (room) {
+            socket.send(JSON.stringify({
+                type: 'stats-update',
+                payload: {
+                    onlineUsers: room.clients.size,
+                    maxCapacity: room.maxCapacity
+                }
+            }));
         }
-    }));
+    }
+}
+
+function broadcastStats(roomId) {
+    const room = rooms.get(roomId);
+    if (room) {
+        const stats = {
+            onlineUsers: room.clients.size,
+            maxCapacity: room.maxCapacity
+        };
+        broadcastToRoom(roomId, {
+            type: 'stats-update',
+            payload: stats
+        });
+    }
 }
 
 async function handleDisconnect(socket) {
     if (socket.roomId && rooms.has(socket.roomId)) {
-        rooms.get(socket.roomId).delete(socket);
-        
-        // PERSISTENT AUDIT LOG
-        await logAuditEvent(socket.caseId, socket.category, 'SESSION_LEAVE', socket.userName, `Disconnected from ${socket.roomId}`);
+        const room = rooms.get(socket.roomId);
+        room.clients.delete(socket);
 
-        if (rooms.get(socket.roomId).size === 0) {
+        await logAuditEvent(socket.roomId, socket.userName, socket.purpose, 'LEAVE');
+
+        if (room.clients.size === 0) {
             rooms.delete(socket.roomId);
         } else {
+            // If admin leaves, assign new admin (oldest connected)
+            if (room.adminId === socket.userId) {
+                const newAdmin = Array.from(room.clients)[0];
+                if (newAdmin) {
+                    room.adminId = newAdmin.userId;
+                    newAdmin.send(JSON.stringify({ type: 'admin-promoted' }));
+                }
+            }
+
             broadcastToRoom(socket.roomId, {
                 type: 'system',
-                payload: {
-                    message: `${socket.userName} has left the session.`,
-                    timestamp: new Date().toISOString()
-                }
+                payload: { message: `${socket.userName} left the chat.`, timestamp: new Date().toISOString() }
             });
+            broadcastStats(socket.roomId);
         }
     }
-    logSystemEvent(`${socket.userName || 'Unknown'} node disconnected`);
 }
 
 function broadcastToRoom(roomId, data) {
-    if (rooms.has(roomId)) {
-        const payload = JSON.stringify(data);
-        rooms.get(roomId).forEach(client => {
+    const room = rooms.get(roomId);
+    if (room) {
+        const payloadStr = JSON.stringify(data);
+        room.clients.forEach(client => {
             if (client.readyState === 1) {
-                client.send(payload);
+                client.send(payloadStr);
             }
         });
     }
